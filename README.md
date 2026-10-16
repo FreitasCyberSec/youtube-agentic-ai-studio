@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/screenshots/banner.png" alt="YAAS: 100% free, $0 per video. Seven agents: Research, Fact-check, Script, Visuals, Voice, Render, Publish" width="100%">
+
 # YAAS — youtube-agentic-ai-studio
 
 **Type an idea. Get a finished, fact-checked YouTube video. Free.**
