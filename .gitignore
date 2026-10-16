@@ -25,6 +25,9 @@ youtube_token.pickle
 *.pickle
 *.pkl
 
+# ── Downloaded fonts (fetched from Google Fonts on first run) ──
+assets/fonts/
+
 # ── Generated output — large files ───────
 output/
 output/images/
@@ -34,7 +37,8 @@ output/images/
 *.jpg
 *.jpeg
 *.png
-!docs/screenshots/*.png    # allow docs screenshots
+# allow docs screenshots
+!docs/screenshots/*.png
 
 # ── OS junk ──────────────────────────────
 .DS_Store
