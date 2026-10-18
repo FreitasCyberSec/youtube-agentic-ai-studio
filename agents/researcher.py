@@ -10,8 +10,8 @@ import time
 import config
 from agents.gemini_client import generate
 from agents.json_utils import extract_json
+from agents.topic_scorer import select_best_candidate
 
-# Path to the banned-topics file (sits next to this package's parent directory)
 _BANNED_TOPICS_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "banned_topics.txt",
@@ -23,7 +23,6 @@ _BUILTIN_BANNED = [
     "Quantum Immortality",
 ]
 
-# All available focus angles — used by researcher AND exposed to the GUI
 FOCUS_ANGLES = [
     "Theoretical Physics & Time Travel",
     "The Dark Forest Theory & Aliens",
@@ -41,36 +40,29 @@ FOCUS_ANGLES = [
 
 
 def load_banned_topics() -> list:
-    """
-    Return the combined list of banned topics.
-    Built-in list is always included; file entries are appended.
-    Returns an empty-safe list — never raises.
-    """
+    """Return built-in plus user-managed banned topics; never raise."""
     topics = list(_BUILTIN_BANNED)
     try:
         if os.path.exists(_BANNED_TOPICS_FILE):
             with open(_BANNED_TOPICS_FILE, encoding="utf-8") as f:
                 for line in f:
-                    t = line.strip()
-                    if t and not t.startswith("#") and t not in topics:
-                        topics.append(t)
-    except Exception as e:
-        print(f"   ⚠ Could not read banned_topics.txt: {e}")
+                    topic = line.strip()
+                    if topic and not topic.startswith("#") and topic not in topics:
+                        topics.append(topic)
+    except Exception as exc:
+        print(f"   ⚠ Could not read banned_topics.txt: {exc}")
     return topics
 
 
 def save_banned_topics(topics: list) -> None:
-    """
-    Write the user-managed portion of the banned list to banned_topics.txt.
-    Built-in topics are excluded from the file (they're always applied anyway).
-    """
-    user_topics = [t for t in topics if t not in _BUILTIN_BANNED and t.strip()]
+    """Write user-managed banned topics; built-ins are always applied."""
+    user_topics = [t.strip() for t in topics if isinstance(t, str)
+                   and t.strip() and t.strip() not in _BUILTIN_BANNED]
     with open(_BANNED_TOPICS_FILE, "w", encoding="utf-8") as f:
         f.write("# One banned topic per line. Lines starting with # are comments.\n")
         f.write("# Built-in banned: The Boltzmann Brain, Simulation Theory, Quantum Immortality\n")
         f.write("# Add topics here after you make a video about them.\n\n")
-        for t in user_topics:
-            f.write(t + "\n")
+        f.write("\n".join(user_topics) + ("\n" if user_topics else ""))
 
 
 def _grounding(topic: str) -> dict:
@@ -92,87 +84,99 @@ def _parse(raw: str) -> dict:
     return data
 
 
+def _select_topic(data: dict, trend_context, banned, channel_description) -> dict:
+    """Use local, explainable heuristics to rank AI-proposed alternatives."""
+    candidates = data.get("topic_candidates")
+    selected = select_best_candidate(
+        candidates,
+        trend_context=trend_context,
+        banned_topics=banned,
+        channel_description=channel_description,
+    )
+    if not selected:
+        # Backwards compatible with providers/models that return the old schema.
+        data["topic_score"] = None
+        data["topic_score_breakdown"] = {}
+        data["topic_candidates_evaluated"] = 1
+        return data
+
+    result = dict(data)
+    result.pop("topic_candidates", None)
+    for key in (
+        "topic", "why_now", "video_title", "description", "hook_question",
+        "key_points", "target_audience", "tags", "thumbnail_concept",
+        "estimated_virality",
+    ):
+        value = selected.get(key)
+        if value not in (None, "", [], {}):
+            result[key] = value
+    result["topic_score"] = selected["topic_score"]
+    result["topic_score_breakdown"] = selected["topic_score_breakdown"]
+    result["topic_candidates_evaluated"] = selected["topic_candidates_evaluated"]
+    print(
+        f"   → Local topic ranking selected \"{result['topic']}\" "
+        f"(heuristic score {result['topic_score']}/100 from "
+        f"{result['topic_candidates_evaluated']} candidates)"
+    )
+    return result
+
+
 def research_topic(channel_description: str,
                    topic_override: str = "",
                    focus_angle: str = "",
                    trend_context: list | None = None) -> dict:
     """
-    Research a video topic for the channel.
+    Research a topic and, for automatic selection, rank multiple AI candidates.
 
-    Parameters
-    ----------
-    channel_description : the channel's style / audience description from config.py
-    topic_override      : if non-empty, Gemini is told to write a video about
-                          THIS EXACT topic — no random angle, no creative
-                          interpretation. The bug fix: previously this was
-                          prepended to channel_description and then ignored
-                          because the random_angle prompt dominated.
-    focus_angle         : if non-empty (and topic_override is empty), use this
-                          angle instead of picking one randomly. Allows the GUI
-                          dropdown to steer AI picks without locking the topic.
-    trend_context       : optional list of headlines trending right now (Trend
-                          Radar). The AI may ride one if it fits the niche.
-
-    The result carries a "grounding" dict ({facts, sources}) from Wikipedia and
-    arXiv that the scriptwriter uses to stay factual and the description cites.
+    Scores are transparent heuristics based on trend overlap, curiosity,
+    specificity, title quality, narrative depth and banned-topic novelty.
+    They are not view predictions. The chosen topic is then grounded in
+    Wikipedia/arXiv as before.
     """
-    banned     = load_banned_topics()
+    banned = load_banned_topics()
     banned_str = ", ".join(f'"{t}"' for t in banned)
 
-    # ── MODE 1: USER-SPECIFIED EXACT TOPIC ───────────────────────────────────
-    # The old bug: topic_override was prepended to channel_description, but the
-    # prompt still said "Focus on: >>> {random_angle} <<<" so Gemini ignored it.
-    # Fix: bypass the angle system entirely and issue a direct instruction.
+    # Mode 1: user explicitly chose the topic; do not replace it.
     if topic_override.strip():
         exact_topic = topic_override.strip()
         print(f"   → Exact topic override: \"{exact_topic}\"")
         grounding = _grounding(exact_topic)
-        facts_block = (f"\nVERIFIED BACKGROUND (from Wikipedia / arXiv — build on these, don't contradict them):\n"
-                       f"{grounding['facts'][:3500]}\n") if grounding["facts"] else ""
-
-        prompt = f"""You are a top YouTube content strategist for a viral science/tech channel.
+        facts_block = (
+            "\nVERIFIED BACKGROUND (from Wikipedia / arXiv — build on these, don't contradict them):\n"
+            f"{grounding['facts'][:3500]}\n"
+        ) if grounding["facts"] else ""
+        prompt = f"""You are a careful YouTube content strategist.
 
 Channel description:
 {channel_description}
 
-MANDATORY INSTRUCTION: You MUST make a video about this EXACT topic:
->>> {exact_topic} <<<
+MANDATORY: make a video about this exact topic: >>> {exact_topic} <<<
+Do not substitute another topic. User choice overrides the banned-topic list.
+BANNED TOPICS for automatic suggestions: {banned_str}
 
-Do NOT substitute a different topic, do NOT pick a related angle — write specifically
-about "{exact_topic}". The user has explicitly requested this topic.
-
-BANNED TOPICS: Do NOT include any of these in the output: {banned_str}
-If the requested topic conflicts with a banned one, still write about it (user override).
-
-Your mission: Research and plan a compelling 6-8 minute YouTube video about "{exact_topic}".
+Plan a compelling 6-8 minute video. Do not claim unsupported facts.
 {facts_block}
-Respond with ONLY a valid JSON object. No markdown fences, no explanation:
-
+Return ONLY valid JSON:
 {{
   "topic": "{exact_topic}",
-  "why_now": "Why this topic resonates with audiences right now",
-  "video_title": "MIND-BLOWING YouTube title under 70 characters about {exact_topic}",
-  "description": "2-sentence YouTube description optimised for SEO and curiosity",
-  "hook_question": "The single most mind-blowing question this video answers",
-  "key_points": [
-    "First key concept or revelation about {exact_topic}",
-    "Second key concept — the twist or surprise",
-    "Third key concept — deeper implication",
-    "Fourth key concept — real-world consequence",
-    "Fifth key concept — the philosophical angle"
-  ],
-  "target_audience": "Exactly who will watch and share this",
-  "tags": ["tag1","tag2","tag3","tag4","tag5","tag6","tag7","tag8"],
-  "thumbnail_concept": "Describe the perfect YouTube thumbnail for this topic",
-  "estimated_virality": "high"
+  "why_now": "Why this topic is relevant to this audience",
+  "video_title": "Specific compelling title under 70 characters",
+  "description": "Two-sentence description",
+  "hook_question": "A concrete question the video answers",
+  "key_points": ["Point one", "Point two", "Point three", "Point four", "Point five"],
+  "target_audience": "Who will watch this",
+  "tags": ["tag1", "tag2", "tag3"],
+  "thumbnail_concept": "Visual concept for a thumbnail",
+  "estimated_virality": "unknown"
 }}"""
-
         data = _parse(generate(prompt))
         data["grounding"] = grounding
+        data.setdefault("topic_score", None)
+        data.setdefault("topic_score_breakdown", {})
+        data.setdefault("topic_candidates_evaluated", 1)
         return data
 
-    # ── MODE 2: AI PICKS THE TOPIC ───────────────────────────────────────────
-    # Use focus_angle if supplied by the GUI dropdown; otherwise pick randomly.
+    # Mode 2: AI proposes alternatives, then local heuristics rank them.
     if focus_angle.strip():
         chosen_angle = focus_angle.strip()
         print(f"   → Focus angle (GUI selected): {chosen_angle}")
@@ -180,54 +184,88 @@ Respond with ONLY a valid JSON object. No markdown fences, no explanation:
         chosen_angle = random.choice(FOCUS_ANGLES)
         print(f"   → Focus angle (random): {chosen_angle}")
 
-    print(f"   → Asking the AI for topic ideas within: {chosen_angle}")
-
+    print(f"   → Generating candidate topics within: {chosen_angle}")
     trend_block = ""
     if trend_context:
         print(f"   → Trend-aware: {len(trend_context)} live headlines from Trend Radar")
-        joined = "\n".join(f"  - {t}" for t in trend_context[:25])
+        joined = "\n".join(
+            f"  - {item.get('title', '')}: {item.get('detail', '')}"
+            if isinstance(item, dict) else f"  - {item}"
+            for item in trend_context[:25]
+        )
         trend_block = (
-            "4. TRENDING RIGHT NOW (news, papers, search spikes):\n"
+            "CURRENT TREND SIGNALS (use only when relevant; do not force a trend):\n"
             f"{joined}\n"
-            "   If one of these connects naturally to the theme, build the video around it "
-            "for timeliness and say so in \"why_now\". If none fit, ignore them.\n"
         )
 
-    prompt = f"""You are a top YouTube content strategist for a viral science/tech channel.
+    prompt = f"""You are a YouTube content strategist. Propose genuinely distinct, researchable video ideas.
 
 Channel description:
 {channel_description}
 
-CRITICAL INSTRUCTIONS FOR THIS RUN:
-1. Focus entirely on this specific theme: >>> {chosen_angle} <<<
-2. BANNED TOPICS: Do NOT suggest any of the following — we already made videos about them: {banned_str}. You must give me a brand new, highly original concept.
-3. Cache Bust ID: {time.time()} (Ensure completely unique output).
+FOCUS THEME: >>> {chosen_angle} <<<
+DO NOT reuse these already-covered topics: {banned_str}
 {trend_block}
-Your mission:
-1. Think of 3-4 highly compelling video topic ideas within that specific theme.
-2. Select the single BEST topic that is genuinely mind-blowing, timely, and explainable in 6-8 minutes.
+Generate 3 distinct candidates. Prefer a specific question, surprising but defensible angle,
+clear audience value, and enough substance for a 6-8 minute video. Avoid generic listicles,
+unsupported conspiracy claims, fake urgency, and titles that promise more than the story delivers.
+Do not say an idea is trending unless the supplied signals support that claim.
+For EACH candidate provide all fields below. Also fill the top-level fields with your own
+initial best candidate for backwards compatibility. The local scorer will choose among candidates.
 
-Respond with ONLY a valid JSON object. No markdown fences, no explanation:
-
+Return ONLY valid JSON:
 {{
-  "topic": "The specific video topic",
-  "why_now": "Why this topic is hitting the zeitgeist right now",
-  "video_title": "MIND-BLOWING YouTube title under 70 characters",
-  "description": "2-sentence YouTube description optimised for SEO and curiosity",
-  "hook_question": "The single most mind-blowing question this video answers",
-  "key_points": [
-    "First key concept or revelation",
-    "Second key concept — the twist or surprise",
-    "Third key concept — deeper implication",
-    "Fourth key concept — real-world consequence",
-    "Fifth key concept — the philosophical angle"
-  ],
-  "target_audience": "Exactly who will watch and share this",
-  "tags": ["tag1","tag2","tag3","tag4","tag5","tag6","tag7","tag8"],
-  "thumbnail_concept": "Describe the perfect YouTube thumbnail",
-  "estimated_virality": "high"
+  "topic": "Initial best candidate topic",
+  "why_now": "Evidence-based relevance",
+  "video_title": "Specific title under 70 characters",
+  "description": "Two-sentence description",
+  "hook_question": "Concrete question answered by the video?",
+  "key_points": ["Point one", "Point two", "Point three", "Point four"],
+  "target_audience": "Specific intended audience",
+  "tags": ["tag1", "tag2", "tag3"],
+  "thumbnail_concept": "Concrete visual concept",
+  "estimated_virality": "unknown",
+  "topic_candidates": [
+    {{
+      "topic": "Candidate one topic",
+      "why_now": "Why it is relevant, without unsupported trend claims",
+      "video_title": "Specific title under 70 characters",
+      "description": "Two-sentence description",
+      "hook_question": "Question the story answers?",
+      "key_points": ["Point one", "Point two", "Point three", "Point four"],
+      "target_audience": "Specific audience",
+      "tags": ["tag1", "tag2", "tag3"],
+      "thumbnail_concept": "Concrete visual concept",
+      "estimated_virality": "unknown"
+    }},
+    {{
+      "topic": "Candidate two topic",
+      "why_now": "Why it is relevant",
+      "video_title": "Specific title under 70 characters",
+      "description": "Two-sentence description",
+      "hook_question": "Question the story answers?",
+      "key_points": ["Point one", "Point two", "Point three", "Point four"],
+      "target_audience": "Specific audience",
+      "tags": ["tag1", "tag2", "tag3"],
+      "thumbnail_concept": "Concrete visual concept",
+      "estimated_virality": "unknown"
+    }},
+    {{
+      "topic": "Candidate three topic",
+      "why_now": "Why it is relevant",
+      "video_title": "Specific title under 70 characters",
+      "description": "Two-sentence description",
+      "hook_question": "Question the story answers?",
+      "key_points": ["Point one", "Point two", "Point three", "Point four"],
+      "target_audience": "Specific audience",
+      "tags": ["tag1", "tag2", "tag3"],
+      "thumbnail_concept": "Concrete visual concept",
+      "estimated_virality": "unknown"
+    }}
+  ]
 }}"""
 
     data = _parse(generate(prompt))
+    data = _select_topic(data, trend_context, banned, channel_description)
     data["grounding"] = _grounding(data["topic"])
     return data
