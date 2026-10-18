@@ -10,7 +10,7 @@ import time
 import config
 from agents.gemini_client import generate
 from agents.json_utils import extract_json
-from agents.topic_scorer import select_best_candidate
+from agents.topic_scorer import score_candidate, select_best_candidate
 
 _BANNED_TOPICS_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -85,7 +85,7 @@ def _parse(raw: str) -> dict:
 
 
 def _select_topic(data: dict, trend_context, banned, channel_description) -> dict:
-    """Use local, explainable heuristics to rank AI-proposed alternatives."""
+    """Rank AI candidates locally, optionally blending public YouTube signals."""
     candidates = data.get("topic_candidates")
     selected = select_best_candidate(
         candidates,
@@ -98,7 +98,61 @@ def _select_topic(data: dict, trend_context, banned, channel_description) -> dic
         data["topic_score"] = None
         data["topic_score_breakdown"] = {}
         data["topic_candidates_evaluated"] = 1
+        data["topic_market_signals"] = {"available": False, "reason": "no_candidates"}
         return data
+
+    # Optional public market signals. Missing key or API failure must never break
+    # the existing heuristic path. API scores are relative to this candidate set.
+    market = {"available": False, "reason": "not_configured", "candidates": []}
+    try:
+        from apis.youtube_opportunities import collect_topic_signals
+        market = collect_topic_signals(candidates)
+    except Exception as exc:
+        market = {"available": False, "reason": "collector_error", "error": str(exc)[:200]}
+
+    market_by_topic = {
+        item.get("topic"): item for item in market.get("candidates", [])
+        if isinstance(item, dict) and item.get("topic")
+    }
+    ranked = []
+    valid_candidates = [
+        candidate for candidate in candidates
+        if isinstance(candidate, dict) and str(candidate.get("topic", "")).strip()
+    ]
+    for candidate in valid_candidates:
+        heuristic = score_candidate(
+            candidate, trend_context=trend_context,
+            banned_topics=banned, channel_description=channel_description,
+        )
+        market_item = market_by_topic.get(str(candidate.get("topic", "")).strip())
+        market_score = (
+            market_item.get("opportunity_score")
+            if market_item and market_item.get("status") == "ok"
+            else None
+        )
+        # Keep the heuristic dominant; only blend real, successful samples.
+        combined = (
+            round(heuristic["score"] * 0.8 + float(market_score) * 0.2, 1)
+            if market_score is not None else heuristic["score"]
+        )
+        ranked.append((combined, candidate, heuristic, market_item))
+    if ranked:
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        combined_score, winner, heuristic, market_item = ranked[0]
+        selected = dict(winner)
+        selected["topic_score"] = combined_score
+        selected["topic_score_breakdown"] = dict(heuristic["components"])
+        if market_item and market_item.get("opportunity_score") is not None:
+            selected["topic_score_breakdown"]["public_youtube_opportunity"] = market_item["opportunity_score"]
+            selected["topic_score_breakdown"]["heuristic_score"] = heuristic["score"]
+        selected["topic_candidates_evaluated"] = len(ranked)
+    selected["topic_market_signals"] = {
+        "available": bool(market.get("available")),
+        "reason": market.get("reason"),
+        "metric": market.get("metric"),
+        "selected_candidate": market_by_topic.get(selected.get("topic", "")),
+        "limitations": market.get("limitations", []),
+    }
 
     result = dict(data)
     result.pop("topic_candidates", None)
@@ -113,10 +167,12 @@ def _select_topic(data: dict, trend_context, banned, channel_description) -> dic
     result["topic_score"] = selected["topic_score"]
     result["topic_score_breakdown"] = selected["topic_score_breakdown"]
     result["topic_candidates_evaluated"] = selected["topic_candidates_evaluated"]
+    result["topic_market_signals"] = selected["topic_market_signals"]
     print(
-        f"   → Local topic ranking selected \"{result['topic']}\" "
-        f"(heuristic score {result['topic_score']}/100 from "
-        f"{result['topic_candidates_evaluated']} candidates)"
+        f"   → Topic ranking selected \"{result['topic']}\" "
+        f"(score {result['topic_score']}/100 from "
+        f"{result['topic_candidates_evaluated']} candidates; "
+        f"public YouTube signals {'used' if market.get('available') else 'not available'})"
     )
     return result
 
