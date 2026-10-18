@@ -1,0 +1,47 @@
+name: mp4-render-validation
+
+on:
+  push:
+    branches: ["test/mp4-render-validation"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  render-and-validate-mp4:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Render a complete sample MP4 with the project renderer
+        run: pytest -q -s tests/test_mp4_render_smoke.py
+
+      - name: Upload generated MP4 for manual inspection
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validated-sample-mp4
+          path: output/final_video.mp4
+          if-no-files-found: warn
+          retention-days: 7
