@@ -1,0 +1,67 @@
+name: gui-smoke-test
+
+on:
+  push:
+    branches: ["test/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gui-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Start GUI and verify HTTP response
+        env:
+          STUDIO_PORT: "7070"
+        run: |
+          python gui.py > gui-smoke.log 2>&1 &
+          GUI_PID=$!
+          trap 'kill "$GUI_PID" 2>/dev/null || true' EXIT
+
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error http://127.0.0.1:7070/ -o gui-home.html; then
+              break
+            fi
+            if ! kill -0 "$GUI_PID" 2>/dev/null; then
+              echo "GUI process exited before becoming ready."
+              cat gui-smoke.log
+              exit 1
+            fi
+            sleep 2
+          done
+
+          test -s gui-home.html || {
+            echo "GUI did not return a non-empty home page."
+            cat gui-smoke.log
+            exit 1
+          }
+
+          echo "GUI returned HTTP 200 and a non-empty home page."
+          head -c 500 gui-home.html
+
+      - name: Show GUI logs if the smoke test fails
+        if: failure()
+        run: cat gui-smoke.log || true
