@@ -1,5 +1,6 @@
 name: tests
 
+# Trigger CI on pushes, pull requests, and manual dispatches.
 on:
   push:
     branches: [main, "feat/**", "fix/**"]
