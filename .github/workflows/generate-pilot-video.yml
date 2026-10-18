@@ -1,0 +1,75 @@
+name: Generate review-only pilot video
+
+on:
+  workflow_dispatch:
+    inputs:
+      topic:
+        description: "Exact topic for the pilot"
+        required: true
+        default: "O mistério da construção das pirâmides do Egito"
+        type: string
+      video_type:
+        description: "Video format"
+        required: true
+        default: "normal"
+        type: choice
+        options:
+          - normal
+          - shorts
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pilot-video-generation
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+      PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
+      - name: Generate video (no upload)
+        run: |
+          python scripts/generate_pilot_video.py --topic "${{ inputs.topic }}" --video-type "${{ inputs.video_type }}" --output output/pilot
+      - name: Validate generated MP4
+        run: |
+          test -s output/pilot/manifest.json
+          VIDEO_PATH="$(python -c "import json; print(json.load(open('output/pilot/manifest.json'))['video_path'])")"
+          test -s "$VIDEO_PATH"
+          ffprobe -v error -show_entries format=duration,size -of json "$VIDEO_PATH"
+          ffmpeg -v error -i "$VIDEO_PATH" -f null -
+      - name: Upload review package
+        uses: actions/upload-artifact@v4
+        with:
+          name: historia-pilot-video
+          path: |
+            output/pilot/final_video.mp4
+            output/pilot/final_short.mp4
+            output/pilot/script.json
+            output/pilot/research.json
+            output/pilot/credits.json
+            output/pilot/manifest.json
+            output/pilot/narration.srt
+          if-no-files-found: error
+          retention-days: 7
