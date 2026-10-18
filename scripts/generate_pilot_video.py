@@ -4,7 +4,13 @@ import argparse
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
+
+# Running a script inside scripts/ puts that folder, not the repository root, on sys.path.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import config
 from agents.researcher import research_topic
